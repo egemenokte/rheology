@@ -49,35 +49,3 @@ npm run dev
 
 Opens at [http://localhost:5173](http://localhost:5173).
 
-## Deploy to Google Cloud Run
-
-### Prerequisites
-- [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) installed and authenticated
-- A GCP project with billing enabled
-
-### Steps
-
-```bash
-# Set your project ID
-export PROJECT_ID=your-gcp-project-id
-
-# Build and push the container image
-gcloud builds submit --tag gcr.io/$PROJECT_ID/rheology
-
-# Deploy to Cloud Run
-gcloud run deploy rheology \
-  --image gcr.io/$PROJECT_ID/rheology \
-  --platform managed \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --port 8080
-```
-
-The app will be served at the URL printed by `gcloud run deploy`.
-
-## Technology
-
-- **React** — UI framework
-- **Recharts** — chart library for creep/relaxation plots
-- **Vite** — build tooling
-- **Nginx** — production static file server (in Docker)
