@@ -1,5 +1,6 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine } from "recharts";
+import AnimatedSchematic from "./AnimatedSchematic";
 
 // ─── Laplace-domain solver ───────────────────────────────────────────────────
 // Spring: Z(s) = E
@@ -59,8 +60,13 @@ function factorial(n) {
   return r;
 }
 
-const STEHFEST_N = 12;
-const coeffs = stehfestCoeffs(STEHFEST_N);
+let STEHFEST_N = 12;
+let coeffs = stehfestCoeffs(STEHFEST_N);
+
+function setStehfestOrder(n) {
+  STEHFEST_N = n;
+  coeffs = stehfestCoeffs(n);
+}
 
 function inverseLaplace(F, t) {
   if (t <= 0) return 0;
@@ -110,39 +116,79 @@ function instantElasticStress(model, eps0) {
   return eps0 * zInf;
 }
 
+// ─── Per-element strain computation using Laplace domain ────────────────────
+// For series: stress is equal → child_strain = parent_strain * Z_parent / Z_child
+// For parallel: strain is equal across all children
+function computeLeafStrains(model, t, rootStrainLaplace) {
+  const result = {};
+  function walk(node, strainLaplace) {
+    if (node.type === "spring" || node.type === "dashpot") {
+      if (t <= 1e-9) {
+        const sLarge = 1e12;
+        const approx = sLarge * strainLaplace(sLarge);
+        result[node.id] = isFinite(approx) ? approx : 0;
+      } else {
+        result[node.id] = inverseLaplace(strainLaplace, t);
+      }
+      return;
+    }
+    if (node.type === "series") {
+      for (const child of node.children) {
+        const childStrainL = (s) => {
+          const zP = impedance(node, s);
+          const zC = impedance(child, s);
+          if (Math.abs(zC) < 1e-30) return 0;
+          return strainLaplace(s) * zP / zC;
+        };
+        walk(child, childStrainL);
+      }
+    }
+    if (node.type === "parallel") {
+      for (const child of node.children) {
+        walk(child, strainLaplace);
+      }
+    }
+  }
+  walk(model, rootStrainLaplace);
+  return result;
+}
+
 function computeCreep(model, tMax, nPoints, sigma0, tRemoval) {
   const data = [];
-  // If tRemoval is set, ensure we have a point exactly at tRemoval
-  // and compute the instant elastic recovery analytically
   const instantDrop = instantElasticStrain(model, sigma0);
-  
+  const creepStrainL = (s) => { const z = impedance(model, s); return z === 0 ? 0 : sigma0 / (s * z); };
+
   for (let i = 0; i <= nPoints; i++) {
     const t = (i / nPoints) * tMax;
-    
-    // Inject exact points at tRemoval
+
     if (tRemoval != null && i > 0) {
       const tPrev = ((i - 1) / nPoints) * tMax;
       if (tPrev < tRemoval && t >= tRemoval) {
-        // Value just before removal
         const valBefore = creepAtTime(model, tRemoval, sigma0);
-        data.push({ t: parseFloat(tRemoval.toFixed(6)), value: parseFloat(valBefore.toFixed(6)), load: sigma0 });
-        // Instant elastic recovery: subtract the instantaneous elastic strain
+        const esBefore = computeLeafStrains(model, tRemoval, creepStrainL);
+        data.push({ t: parseFloat(tRemoval.toFixed(6)), value: parseFloat(valBefore.toFixed(6)), load: sigma0, elementStrains: esBefore });
         const valAfter = valBefore - instantDrop;
-        data.push({ t: parseFloat(tRemoval.toFixed(6)), value: parseFloat(valAfter.toFixed(6)), load: 0 });
+        data.push({ t: parseFloat(tRemoval.toFixed(6)), value: parseFloat(valAfter.toFixed(6)), load: 0, elementStrains: esBefore });
         if (Math.abs(t - tRemoval) < (tMax / nPoints) * 0.5) continue;
       }
     }
-    
-    let val;
+
+    let val, es;
     if (tRemoval != null && t > tRemoval) {
       val = creepAtTime(model, t, sigma0) - creepAtTime(model, t - tRemoval, sigma0);
+      const esL = computeLeafStrains(model, t, creepStrainL);
+      const esU = computeLeafStrains(model, t - tRemoval, creepStrainL);
+      es = {};
+      for (const id of Object.keys(esL)) es[id] = esL[id] - (esU[id] || 0);
     } else {
       val = creepAtTime(model, t, sigma0);
+      es = computeLeafStrains(model, t, creepStrainL);
     }
     data.push({
       t: parseFloat(t.toFixed(6)),
       value: parseFloat(val.toFixed(6)),
       load: (tRemoval != null && t > tRemoval) ? 0 : sigma0,
+      elementStrains: es,
     });
   }
   return data;
@@ -151,96 +197,127 @@ function computeCreep(model, tMax, nPoints, sigma0, tRemoval) {
 function computeRelaxation(model, tMax, nPoints, eps0, tRemoval) {
   const data = [];
   const instantDrop = instantElasticStress(model, eps0);
-  
+  const relaxStrainL = (s) => eps0 / s;
+
   for (let i = 0; i <= nPoints; i++) {
     const t = (i / nPoints) * tMax;
-    
+
     if (tRemoval != null && i > 0) {
       const tPrev = ((i - 1) / nPoints) * tMax;
       if (tPrev < tRemoval && t >= tRemoval) {
         const valBefore = relaxAtTime(model, tRemoval, eps0);
-        data.push({ t: parseFloat(tRemoval.toFixed(6)), value: parseFloat(valBefore.toFixed(6)), load: eps0 });
+        const esBefore = computeLeafStrains(model, tRemoval, relaxStrainL);
+        data.push({ t: parseFloat(tRemoval.toFixed(6)), value: parseFloat(valBefore.toFixed(6)), load: eps0, elementStrains: esBefore });
         const valAfter = valBefore - instantDrop;
-        data.push({ t: parseFloat(tRemoval.toFixed(6)), value: parseFloat(valAfter.toFixed(6)), load: 0 });
+        data.push({ t: parseFloat(tRemoval.toFixed(6)), value: parseFloat(valAfter.toFixed(6)), load: 0, elementStrains: esBefore });
         if (Math.abs(t - tRemoval) < (tMax / nPoints) * 0.5) continue;
       }
     }
-    
-    let val;
+
+    let val, es;
     if (tRemoval != null && t > tRemoval) {
       val = relaxAtTime(model, t, eps0) - relaxAtTime(model, t - tRemoval, eps0);
+      const esL = computeLeafStrains(model, t, relaxStrainL);
+      const esU = computeLeafStrains(model, t - tRemoval, relaxStrainL);
+      es = {};
+      for (const id of Object.keys(esL)) es[id] = esL[id] - (esU[id] || 0);
     } else {
       val = relaxAtTime(model, t, eps0);
+      es = computeLeafStrains(model, t, relaxStrainL);
     }
     data.push({
       t: parseFloat(t.toFixed(6)),
       value: parseFloat(val.toFixed(6)),
       load: (tRemoval != null && t > tRemoval) ? 0 : eps0,
+      elementStrains: es,
     });
   }
   return data;
 }
 
+
 // ─── Preset models ──────────────────────────────────────────────────────────
 const PRESETS = {
   maxwell: {
     name: "Maxwell",
-    model: { type: "series", id: "root", children: [
-      { type: "spring", id: "s1", E: 100 },
-      { type: "dashpot", id: "d1", eta: 50 },
-    ]},
+    model: {
+      type: "series", id: "root", children: [
+        { type: "spring", id: "s1", E: 100 },
+        { type: "dashpot", id: "d1", eta: 50 },
+      ]
+    },
   },
   voigt: {
     name: "Voigt (Kelvin)",
-    model: { type: "parallel", id: "root", children: [
-      { type: "spring", id: "s1", E: 100 },
-      { type: "dashpot", id: "d1", eta: 50 },
-    ]},
+    model: {
+      type: "parallel", id: "root", children: [
+        { type: "spring", id: "s1", E: 100 },
+        { type: "dashpot", id: "d1", eta: 50 },
+      ]
+    },
   },
   "std-3-maxwell": {
     name: "Standard Linear Solid (3-elem Maxwell)",
-    model: { type: "parallel", id: "root", children: [
-      { type: "spring", id: "s1", E: 60 },
-      { type: "series", id: "arm", children: [
-        { type: "spring", id: "s2", E: 100 },
-        { type: "dashpot", id: "d1", eta: 50 },
-      ]},
-    ]},
+    model: {
+      type: "parallel", id: "root", children: [
+        { type: "spring", id: "s1", E: 60 },
+        {
+          type: "series", id: "arm", children: [
+            { type: "spring", id: "s2", E: 100 },
+            { type: "dashpot", id: "d1", eta: 50 },
+          ]
+        },
+      ]
+    },
   },
   "std-3-voigt": {
     name: "Standard Linear Solid (3-elem Voigt)",
-    model: { type: "series", id: "root", children: [
-      { type: "spring", id: "s1", E: 100 },
-      { type: "parallel", id: "arm", children: [
-        { type: "spring", id: "s2", E: 60 },
-        { type: "dashpot", id: "d1", eta: 50 },
-      ]},
-    ]},
+    model: {
+      type: "series", id: "root", children: [
+        { type: "spring", id: "s1", E: 100 },
+        {
+          type: "parallel", id: "arm", children: [
+            { type: "spring", id: "s2", E: 60 },
+            { type: "dashpot", id: "d1", eta: 50 },
+          ]
+        },
+      ]
+    },
   },
   burgers: {
     name: "Burgers (4-element)",
-    model: { type: "series", id: "root", children: [
-      { type: "spring", id: "s1", E: 100 },
-      { type: "dashpot", id: "d1", eta: 200 },
-      { type: "parallel", id: "kv", children: [
-        { type: "spring", id: "s2", E: 80 },
-        { type: "dashpot", id: "d2", eta: 40 },
-      ]},
-    ]},
+    model: {
+      type: "series", id: "root", children: [
+        { type: "spring", id: "s1", E: 100 },
+        { type: "dashpot", id: "d1", eta: 200 },
+        {
+          type: "parallel", id: "kv", children: [
+            { type: "spring", id: "s2", E: 80 },
+            { type: "dashpot", id: "d2", eta: 40 },
+          ]
+        },
+      ]
+    },
   },
   "gen-maxwell": {
     name: "Generalized Maxwell (Prony)",
-    model: { type: "parallel", id: "root", children: [
-      { type: "spring", id: "s_eq", E: 30 },
-      { type: "series", id: "arm1", children: [
-        { type: "spring", id: "s1", E: 80 },
-        { type: "dashpot", id: "d1", eta: 40 },
-      ]},
-      { type: "series", id: "arm2", children: [
-        { type: "spring", id: "s2", E: 50 },
-        { type: "dashpot", id: "d2", eta: 120 },
-      ]},
-    ]},
+    model: {
+      type: "parallel", id: "root", children: [
+        { type: "spring", id: "s_eq", E: 30 },
+        {
+          type: "series", id: "arm1", children: [
+            { type: "spring", id: "s1", E: 80 },
+            { type: "dashpot", id: "d1", eta: 40 },
+          ]
+        },
+        {
+          type: "series", id: "arm2", children: [
+            { type: "spring", id: "s2", E: 50 },
+            { type: "dashpot", id: "d2", eta: 120 },
+          ]
+        },
+      ]
+    },
   },
 };
 
@@ -531,6 +608,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState("build");
   const [computing, setComputing] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
+  const [animTime, setAnimTime] = useState({ t: null, value: null, mode: null, active: false });
+  const [stehfestN, setStehfestNState] = useState(STEHFEST_N);
+  const setStehfestN = (n) => { setStehfestNState(n); setStehfestOrder(n); };
 
   const selectedNode = selectedId ? findNode(model, selectedId) : null;
   const parentOfSelected = selectedId ? findParent(model, selectedId) : null;
@@ -549,7 +629,7 @@ export default function App() {
       }
       setComputing(false);
     }, 50);
-  }, [model, tMax, nPoints, sigma0, eps0, tRemoval, enableRemoval]);
+  }, [model, tMax, nPoints, sigma0, eps0, tRemoval, enableRemoval, stehfestN]);
 
   // Auto-compute on model change
   useEffect(() => {
@@ -568,16 +648,20 @@ export default function App() {
     setModel(addChild(model, parentId, { type: "dashpot", id: genId(), eta: 50 }));
   };
   const handleAddSeries = (parentId) => {
-    setModel(addChild(model, parentId, { type: "series", id: genId(), children: [
-      { type: "spring", id: genId(), E: 100 },
-      { type: "dashpot", id: genId(), eta: 50 },
-    ]}));
+    setModel(addChild(model, parentId, {
+      type: "series", id: genId(), children: [
+        { type: "spring", id: genId(), E: 100 },
+        { type: "dashpot", id: genId(), eta: 50 },
+      ]
+    }));
   };
   const handleAddParallel = (parentId) => {
-    setModel(addChild(model, parentId, { type: "parallel", id: genId(), children: [
-      { type: "spring", id: genId(), E: 100 },
-      { type: "dashpot", id: genId(), eta: 50 },
-    ]}));
+    setModel(addChild(model, parentId, {
+      type: "parallel", id: genId(), children: [
+        { type: "spring", id: genId(), E: 100 },
+        { type: "dashpot", id: genId(), eta: 50 },
+      ]
+    }));
   };
   const handleRemove = (id) => {
     if (id === model.id) return; // can't remove root
@@ -676,8 +760,8 @@ export default function App() {
     const dotColor = node.type === "spring" ? "#b8543f" : node.type === "dashpot" ? "#5b7a6a" : null;
     const labelText = node.type === "spring" ? `Spring  E = ${node.E}`
       : node.type === "dashpot" ? `Dashpot  η = ${node.eta}`
-      : node.type === "series" ? "Series"
-      : "Parallel";
+        : node.type === "series" ? "Series"
+          : "Parallel";
     const groupColor = isSel ? "#a8c7fa" : "#8a8272";
     return (
       <div style={{ marginLeft: depth * 16 }}>
@@ -830,31 +914,35 @@ export default function App() {
               <button onClick={() => setShowInfo(false)} style={{ background: "none", border: "none", color: "#7a7466", fontSize: 20, cursor: "pointer", padding: "0 4px" }}>&times;</button>
             </div>
             <p style={{ margin: "0 0 12px 0" }}>
-              This interactive tool lets you build arbitrary viscoelastic rheological models by combining springs (elastic elements) and dashpots (viscous elements) in series and parallel arrangements. It then computes and plots both the <strong style={{ color: "#b8543f" }}>creep response</strong> (strain under constant stress) and <strong style={{ color: "#5b8a6a" }}>relaxation response</strong> (stress under constant strain).
+              This interactive tool lets you build arbitrary viscoelastic rheological models by combining springs (elastic elements) and dashpots (viscous elements) in series and parallel arrangements. It computes and plots both the <strong style={{ color: "#b8543f" }}>creep response</strong> (strain under constant stress) and <strong style={{ color: "#5b8a6a" }}>relaxation response</strong> (stress under constant strain).
             </p>
             <p style={{ margin: "0 0 12px 0" }}>
               <strong style={{ color: "#e8e0d0" }}>How it works:</strong> Each element is treated as a mechanical impedance in the Laplace domain. A spring has impedance Z(s) = E, and a dashpot has Z(s) = ηs. Series elements combine like parallel resistors (compliances add) and parallel elements combine like series resistors (impedances add). The time-domain response is recovered via numerical inverse Laplace transform using the Stehfest algorithm.
             </p>
             <p style={{ margin: "0 0 12px 0" }}>
-              <strong style={{ color: "#e8e0d0" }}>Load removal and recovery:</strong> When enabled, the tool uses the Boltzmann superposition principle to simulate what happens after the load is removed at a given time t₁. It superimposes a negative step at t₁ onto the original response, so the total response for t {">"} t₁ becomes R(t) minus R(t - t₁). This reveals whether the material recovers fully, partially, or not at all.
+              <strong style={{ color: "#e8e0d0" }}>Animated schematic:</strong> The schematic animates internal displacements of each element. For <em>creep</em>, a constant stress is applied and elements stretch over time. For <em>relaxation</em>, a constant strain is applied (total displacement stays fixed) while internal element strains redistribute. The animation starts with a brief rest period before t₀ showing the unloaded state. Dashed reference lines mark each element's rest-width boundaries so you can see relative displacement.
+            </p>
+            <p style={{ margin: "0 0 12px 0" }}>
+              <strong style={{ color: "#e8e0d0" }}>Per-element strains:</strong> Each element's strain is computed individually using Laplace-domain impedance ratios. In series, all elements share the same stress but have different strains (ε_child = ε_total × Z_series / Z_child). In parallel, all elements share the same strain. This makes internal redistribution visible. For example, in a Maxwell element under relaxation, the spring relaxes as the dashpot flows.
+            </p>
+            <p style={{ margin: "0 0 12px 0" }}>
+              <strong style={{ color: "#e8e0d0" }}>Load removal & recovery:</strong> When enabled, the tool uses the Boltzmann superposition principle to simulate what happens after the load is removed at t₁. It superimposes a negative step at t₁, so the total response for t {">"}  t₁ becomes R(t) − R(t − t₁). This reveals whether the material recovers fully, partially, or not at all.
             </p>
             <p style={{ margin: "0 0 12px 0" }}>
               <strong style={{ color: "#e8e0d0" }}>How to use:</strong>
             </p>
-            <p style={{ margin: "0 0 6px 0" }}>
-              1. Pick a preset from the <em>Presets</em> tab or build your own model in the <em>Build</em> tab.
+            <p style={{ margin: "0 0 6px 0" }}>1. Pick a preset from the <em>Presets</em> tab or build your own model in the <em>Build</em> tab.</p>
+            <p style={{ margin: "0 0 6px 0" }}>2. Click any element in the schematic/tree to select it and edit its properties, add children, or convert groups.</p>
+            <p style={{ margin: "0 0 6px 0" }}>3. Adjust loading magnitudes, time range, and load removal in the <em>Params</em> tab.</p>
+            <p style={{ margin: "0 0 6px 0" }}>4. Use the animation controls (below the schematic) to play/scrub through creep or relaxation mode and observe internal element behavior.</p>
+            <p style={{ margin: "0 0 6px 0" }}>5. The active mode's plot is shown first, so switching between Creep/Relax in the animation also brings the corresponding plot to the top.</p>
+            <p style={{ margin: "0 0 12px 0" }}>
+              <strong style={{ color: "#e8e0d0" }}>Numerical parameters:</strong>
             </p>
-            <p style={{ margin: "0 0 6px 0" }}>
-              2. Click any element in the schematic or tree to select it. You can edit its properties, add children to groups, remove elements, or convert groups between series and parallel.
-            </p>
-            <p style={{ margin: "0 0 6px 0" }}>
-              3. Adjust loading magnitudes, time range, and load removal settings in the <em>Params</em> tab. Values are applied when you press Enter or click away from the input field.
-            </p>
-            <p style={{ margin: "0 0 6px 0" }}>
-              4. The creep and relaxation curves update automatically as you modify the model.
-            </p>
+            <p style={{ margin: "0 0 6px 0", fontSize: 13 }}>• <strong>Resolution (points)</strong> — Number of time-domain sample points. More points give smoother curves but increase computation. Default: 200.</p>
+            <p style={{ margin: "0 0 6px 0", fontSize: 13 }}>• <strong>Stehfest N</strong> — Order of the Stehfest inverse Laplace transform algorithm. Must be even. Higher N gives more accuracy but can become numerically unstable for very stiff systems. Default: 12. Try 8–16; values above 20 are rarely useful.</p>
             <p style={{ margin: "16px 0 0 0", fontSize: 12, fontFamily: "'DM Mono', monospace", color: "#5a5444" }}>
-              This approach generalizes classic models (Maxwell, Kelvin-Voigt, Standard Linear Solid, Burgers, generalized Prony series) to handle any tree-structured spring-dashpot network.
+              Generalizes classic models (Maxwell, Kelvin-Voigt, SLS, Burgers, Prony series) to any tree-structured spring-dashpot network.
             </p>
           </div>
         </div>
@@ -982,6 +1070,14 @@ export default function App() {
                   <label style={{ fontSize: 12, fontFamily: "'DM Mono', monospace", color: "#7a7466", display: "block", marginBottom: 4 }}>Resolution (points)</label>
                   <NumericInput value={nPoints} onChange={(v) => setNPoints(Math.round(v))} style={wideInputStyle} />
                 </div>
+                <div style={{ padding: "10px 0 0 0", borderTop: "1px solid #2a2720", marginTop: 8 }}>
+                  <div style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", color: "#5a5444", textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Stability / Numerical</div>
+                  <div>
+                    <label style={{ fontSize: 12, fontFamily: "'DM Mono', monospace", color: "#7a7466", display: "block", marginBottom: 4 }}>Stehfest N (even, default 12)</label>
+                    <NumericInput value={stehfestN} onChange={(v) => { const n = Math.round(v); if (n >= 2 && n <= 30 && n % 2 === 0) setStehfestN(n); }} style={wideInputStyle} />
+                    <p style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", color: "#5a5444", margin: "4px 0 0 0" }}>Accuracy of inverse Laplace (higher = more accurate but may cause instability).</p>
+                  </div>
+                </div>
               </div>
             )}
           </div>
@@ -989,7 +1085,7 @@ export default function App() {
 
         {/* Main area */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "auto" }}>
-          {/* Schematic */}
+          {/* Schematic with Animation */}
           <div style={{
             padding: "16px 32px",
             borderBottom: "1px solid #2a2720",
@@ -998,7 +1094,14 @@ export default function App() {
             <div style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#5a5444", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>
               Rheological Schematic
             </div>
-            <Schematic model={model} selectedId={selectedId} onSelect={setSelectedId} />
+            <AnimatedSchematic
+              model={model}
+              creepData={plotData ? plotData.creep : null}
+              relaxData={plotData ? plotData.relax : null}
+              sigma0={sigma0}
+              eps0={eps0}
+              onTimeChange={setAnimTime}
+            />
           </div>
 
           {/* Plots */}
@@ -1008,10 +1111,9 @@ export default function App() {
                 Computing...
               </div>
             )}
-            {plotData && !computing && (
-              <>
-                {/* Creep */}
-                <div style={{ flex: 1, minHeight: 280 }}>
+            {plotData && !computing && (() => {
+              const creepPlot = (
+                <div key="creep" style={{ flex: 1, minHeight: 280 }}>
                   <div style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#5a5444", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>
                     Creep Response — ε(t) at σ₀ = {sigma0}{enableRemoval ? `, load removed at t = ${tRemoval}` : ""}
                   </div>
@@ -1022,31 +1124,27 @@ export default function App() {
                           <CartesianGrid stroke="#2a2720" strokeDasharray="3 3" />
                           <XAxis dataKey="t" type="number" domain={[0, "auto"]} stroke="#5a5444" tick={{ fontSize: 11, fontFamily: "'DM Mono', monospace" }} label={{ value: "t", position: "insideBottomRight", offset: -5, style: { fontSize: 12, fill: "#7a7466" } }} />
                           <YAxis stroke="#5a5444" tick={{ fontSize: 11, fontFamily: "'DM Mono', monospace" }} label={{ value: "ε(t)", angle: -90, position: "insideLeft", offset: 10, style: { fontSize: 12, fill: "#7a7466" } }} />
-                          <Tooltip
-                            contentStyle={{ background: "#1c1a16", border: "1px solid #2a2720", borderRadius: 6, fontSize: 12, fontFamily: "'DM Mono', monospace" }}
-                            labelStyle={{ color: "#7a7466" }}
-                            labelFormatter={(val) => `t = ${parseFloat(val).toFixed(4)}`}
-                            formatter={(value, name) => [parseFloat(value).toFixed(4), name]}
-                          />
+                          <Tooltip contentStyle={{ background: "#1c1a16", border: "1px solid #2a2720", borderRadius: 6, fontSize: 12, fontFamily: "'DM Mono', monospace" }} labelStyle={{ color: "#7a7466" }} labelFormatter={(val) => `t = ${parseFloat(val).toFixed(4)}`} formatter={(value, name) => [parseFloat(value).toFixed(4), name]} />
                           {enableRemoval && <ReferenceLine x={tRemoval} stroke="#a8c7fa" strokeDasharray="6 3" strokeWidth={1.5} label={{ value: "unload", position: "top", fill: "#a8c7fa", fontSize: 10, fontFamily: "'DM Mono', monospace" }} />}
+                          {animTime.active && animTime.mode === "creep" && animTime.t != null && <ReferenceLine x={animTime.t} stroke="#e8e0d0" strokeWidth={1.5} strokeDasharray="4 2" label={{ value: `t=${animTime.t.toFixed(1)}`, position: "top", fill: "#e8e0d0", fontSize: 9, fontFamily: "'DM Mono', monospace" }} />}
                           <Line type="monotone" dataKey="value" stroke="#b8543f" strokeWidth={2.5} dot={false} name="ε(t)" />
                         </LineChart>
                       </ResponsiveContainer>
-                      {/* Loading profile mini-chart */}
                       <ResponsiveContainer width="100%" height={60}>
                         <LineChart data={plotData.creep} margin={{ top: 2, right: 20, left: 10, bottom: 5 }}>
                           <XAxis dataKey="t" type="number" domain={[0, "auto"]} stroke="#5a5444" tick={{ fontSize: 9, fontFamily: "'DM Mono', monospace" }} />
                           <YAxis stroke="#5a5444" tick={{ fontSize: 9, fontFamily: "'DM Mono', monospace" }} domain={[0, 'auto']} label={{ value: "σ", angle: -90, position: "insideLeft", offset: 10, style: { fontSize: 10, fill: "#7a7466" } }} />
                           {enableRemoval && <ReferenceLine x={tRemoval} stroke="#a8c7fa" strokeDasharray="4 2" strokeWidth={1} />}
+                          {animTime.active && animTime.mode === "creep" && animTime.t != null && <ReferenceLine x={animTime.t} stroke="#e8e0d0" strokeWidth={1} strokeDasharray="3 2" />}
                           <Line type="stepAfter" dataKey="load" stroke="#7a7466" strokeWidth={1.5} dot={false} />
                         </LineChart>
                       </ResponsiveContainer>
                     </div>
                   </div>
                 </div>
-
-                {/* Relaxation */}
-                <div style={{ flex: 1, minHeight: 280 }}>
+              );
+              const relaxPlot = (
+                <div key="relax" style={{ flex: 1, minHeight: 280 }}>
                   <div style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#5a5444", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>
                     Relaxation Response — σ(t) at ε₀ = {eps0}{enableRemoval ? `, load removed at t = ${tRemoval}` : ""}
                   </div>
@@ -1057,30 +1155,29 @@ export default function App() {
                           <CartesianGrid stroke="#2a2720" strokeDasharray="3 3" />
                           <XAxis dataKey="t" type="number" domain={[0, "auto"]} stroke="#5a5444" tick={{ fontSize: 11, fontFamily: "'DM Mono', monospace" }} label={{ value: "t", position: "insideBottomRight", offset: -5, style: { fontSize: 12, fill: "#7a7466" } }} />
                           <YAxis stroke="#5a5444" tick={{ fontSize: 11, fontFamily: "'DM Mono', monospace" }} label={{ value: "σ(t)", angle: -90, position: "insideLeft", offset: 10, style: { fontSize: 12, fill: "#7a7466" } }} />
-                          <Tooltip
-                            contentStyle={{ background: "#1c1a16", border: "1px solid #2a2720", borderRadius: 6, fontSize: 12, fontFamily: "'DM Mono', monospace" }}
-                            labelStyle={{ color: "#7a7466" }}
-                            labelFormatter={(val) => `t = ${parseFloat(val).toFixed(4)}`}
-                            formatter={(value, name) => [parseFloat(value).toFixed(4), name]}
-                          />
+                          <Tooltip contentStyle={{ background: "#1c1a16", border: "1px solid #2a2720", borderRadius: 6, fontSize: 12, fontFamily: "'DM Mono', monospace" }} labelStyle={{ color: "#7a7466" }} labelFormatter={(val) => `t = ${parseFloat(val).toFixed(4)}`} formatter={(value, name) => [parseFloat(value).toFixed(4), name]} />
                           {enableRemoval && <ReferenceLine x={tRemoval} stroke="#a8c7fa" strokeDasharray="6 3" strokeWidth={1.5} label={{ value: "unload", position: "top", fill: "#a8c7fa", fontSize: 10, fontFamily: "'DM Mono', monospace" }} />}
+                          {animTime.active && animTime.mode === "relax" && animTime.t != null && <ReferenceLine x={animTime.t} stroke="#e8e0d0" strokeWidth={1.5} strokeDasharray="4 2" label={{ value: `t=${animTime.t.toFixed(1)}`, position: "top", fill: "#e8e0d0", fontSize: 9, fontFamily: "'DM Mono', monospace" }} />}
                           <Line type="monotone" dataKey="value" stroke="#5b8a6a" strokeWidth={2.5} dot={false} name="σ(t)" />
                         </LineChart>
                       </ResponsiveContainer>
-                      {/* Loading profile mini-chart */}
                       <ResponsiveContainer width="100%" height={60}>
                         <LineChart data={plotData.relax} margin={{ top: 2, right: 20, left: 10, bottom: 5 }}>
                           <XAxis dataKey="t" type="number" domain={[0, "auto"]} stroke="#5a5444" tick={{ fontSize: 9, fontFamily: "'DM Mono', monospace" }} />
                           <YAxis stroke="#5a5444" tick={{ fontSize: 9, fontFamily: "'DM Mono', monospace" }} domain={[0, 'auto']} label={{ value: "ε", angle: -90, position: "insideLeft", offset: 10, style: { fontSize: 10, fill: "#7a7466" } }} />
                           {enableRemoval && <ReferenceLine x={tRemoval} stroke="#a8c7fa" strokeDasharray="4 2" strokeWidth={1} />}
+                          {animTime.active && animTime.mode === "relax" && animTime.t != null && <ReferenceLine x={animTime.t} stroke="#e8e0d0" strokeWidth={1} strokeDasharray="3 2" />}
                           <Line type="stepAfter" dataKey="load" stroke="#7a7466" strokeWidth={1.5} dot={false} />
                         </LineChart>
                       </ResponsiveContainer>
                     </div>
                   </div>
                 </div>
-              </>
-            )}
+              );
+              // Show active animation mode's plot first
+              return animTime.mode === "relax" ? <>{relaxPlot}{creepPlot}</> : <>{creepPlot}{relaxPlot}</>;
+            })()
+            }
           </div>
         </div>
       </div>
